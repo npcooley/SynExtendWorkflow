@@ -1,0 +1,258 @@
+---
+title: "README"
+author: "npc"
+date: "`r Sys.Date()`"
+output:
+  github_document: default
+knit: (function(inputFile, encoding) {
+                rmarkdown::render(inputFile,
+                                  encoding = encoding,
+                                  output_format = "all")
+        })
+---
+
+# Working With SynExtend
+
+The SynExtend R package was originally built as a set of tools for building out lists of orthologous gene pairs from biological data, though it has since expanded. It is currently a work in progress. The provided workflow here is a simple example built to showcase usage and outputs of the orthology prediction tools housed within. The most unfinished part of this workflow is in the `SelectByK` function that uses a naive k-means based approach to drop assumed false positive pairs.
+
+## Initial workspace setup
+
+This workflow is loading in two ad-hoc functions, one is an updated version of a function within `SynExtend`, the other is an additional function for providing context to orthologous pairs.
+
+```{r, libraries and functions and workspace setup, include = TRUE, echo = TRUE}
+# start the timer
+TIMESTART <- Sys.time()
+
+# load in some libraries 
+suppressMessages(library(SynExtend))
+suppressMessages(library(igraph))
+# SelectByK has had some minor adjustments, this imported version was added to v 1.13.5 (devel)
+source(file = "R/SelectByK.R",
+       echo = FALSE)
+# The block size adjacency observer in PairSummaries() will eventually be superceded by this function
+source(file = "R/BlockSize.R",
+       echo = FALSE)
+set.seed(1986)
+
+# Sasha's distinct colors, hexcodes,
+# from:
+# https://sashamaps.net/docs/resources/20-colors/
+ColVec1 <- c('#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#42d4f4', '#f032e6', '#fabed4', '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000', '#aaffc3', '#000075', '#a9a9a9', '#ffffff', '#000000')
+ColVec2 <- paste0(ColVec1,
+                  "33")
+ColVec3 <- paste0(ColVec1,
+                  "50")
+# specifically for the overlapping histogram
+ColVec4 <- ColVec3[c(1:6, 13, 15, 18)]
+```
+
+## Data Collection Part 1 
+
+The NCBI Edirect tools can be used to collect small, or large sets of data to evaluate. In this case a small example set of bacterial genomes and their annotations can be selected.
+
+```{r, edirect, include = TRUE, echo = TRUE}
+# using NCBI edirect tools to grab a small digestible test set
+Selection <- "deinococcus"
+EntrezQuery <- paste("esearch -db assembly ",
+                     "-query '",
+                     Selection,
+                     "[organism] ",
+                     'AND "complete genome"[filter] ',
+                     'AND "refseq has annotation"[properties] ',
+                     "NOT anomalous[filter]' ",
+                     '| ',
+                     'esummary ',
+                     '| ',
+                     'xtract -pattern DocumentSummary -element FtpPath_RefSeq',
+                     sep = "")
+FtPPaths <- system(command = EntrezQuery,
+                   intern = TRUE,
+                   timeout = 500L)
+if (length(FtPPaths) > 5L) {
+  FtPPaths <- FtPPaths[sample(x = length(FtPPaths),
+                              size = 5L,
+                              replace = FALSE)]
+}
+```
+
+## Data Collection Part 2
+
+Pull the FNA and GFF files associated with the selected genomes, build a DECIPHER DB, and manage the gene calls.
+
+```{r, data collection, include = TRUE, echo = TRUE}
+# grab associated FNAs and GFFs
+FNAs <- unname(sapply(FtPPaths,
+                      function(x) paste(x,
+                                        "/",
+                                        strsplit(x,
+                                                 split = "/",
+                                                 fixed = TRUE)[[1]][10],
+                                        "_genomic.fna.gz",
+                                        sep = "")))
+GFFs <- unname(sapply(FtPPaths,
+                      function(x) paste(x,
+                                        "/",
+                                        strsplit(x,
+                                                 split = "/",
+                                                 fixed = TRUE)[[1]][10],
+                                        "_genomic.gff.gz",
+                                        sep = "")))
+
+GC01 <- vector(mode = "list",
+               length = length(FNAs))
+
+DBPATH <- paste0(getwd(),
+                 "/data/",
+                 Selection,
+                 ".sqlite")
+
+for (m1 in seq_along(FNAs)) {
+  
+  
+  X <- readDNAStringSet(FNAs[m1])
+  
+  Seqs2DB(seqs = X,
+          type = "XStringSet",
+          dbFile = DBPATH,
+          identifier = as.character(m1),
+          verbose = TRUE)
+  
+  GC01[[m1]] <- gffToDataFrame(GFF = GFFs[m1],
+                               Verbose = TRUE)
+}
+
+names(GC01) <- seq(length(GC01))
+```
+
+## Build a Synteny Map
+
+See the DECIPHER documentation for further reading. This is a modestly diverse set of genomes within the same genera, and what we see in the below pairs plot, combined with a general summary of syntenic hits is that though they share reasonable amounts of ordered information, those individual blocks of order are still pretty fractious. This is a modestly difficult test case for our tools in this workflow.
+
+```{r, synteny map, include = TRUE, echo = TRUE}
+Syn01 <- FindSynteny(dbFile = DBPATH,
+                     verbose = TRUE,
+                     processors = NULL)
+print(Syn01)
+pairs(Syn01)
+```
+
+## Build Predicted Pairs
+
+Reconcile syntenic hits with gene calls to build out an initial list of predicted pairs.
+
+```{r, pairwise connections and evaluations, include = TRUE, echo = TRUE}
+L01 <- NucleotideOverlap(SyntenyObject = Syn01,
+                         GeneCalls = GC01,
+                         LimitIndex = FALSE,
+                         AcceptContigNames = TRUE,
+                         Verbose = TRUE)
+P01 <- PairSummaries(SyntenyLinks = L01,
+                     GeneCalls = GC01,
+                     DBPATH = DBPATH,
+                     PIDs = TRUE,
+                     Score = TRUE,
+                     Verbose = TRUE)
+hist(P01$PID, breaks = 100)
+```
+
+## State of the Data
+
+Some of these predictions are good, some are bad, and we have somewhat limited data available to evaluate these pairings. In the `P01` object, columns 3-8 represent generalized information about the blocks of information that led to the prediction, while columns 10, 11, and 12 represent general evaluations of the pairings themselves.
+
+```{r, view pairs, include = TRUE, echo = TRUE}
+head(P01)
+dim(P01)
+
+pairs(P01[, c(3:8, 10:12)], pch = 46)
+```
+
+## Evaluate Predicted Pairs
+
+As seen in the above histogram, predicted pairs span the range of available PIDs. Where users choose to threshold their PIDs is a complicated series of value judgements based on their downstream needs, and confidence preferences, however hard cutoffs are often inappropriate for the data generated herein. To give users at least some tools to avoid a hard threshold and effectively drop bad predictions, the `SelectByK` function was constructed to use a K-means approach where users provide a PID confidence that signifies the **lowest PID centroid at which a cluster represents TRUE pairings**.
+
+```{r, naively trim false positives, include = TRUE, echo = TRUE}
+P02 <- suppressWarnings(SelectByK(Pairs = P01,
+                                  ClusterScalar = 4L, # default is 1, though that isn't likely to be aligned with user preferences
+                                  UserConfidence = 0.5, # this is the PID that the cluster centroid must be above to be retained
+                                  Verbose = TRUE,
+                                  ShowPlot = TRUE,
+                                  ReturnAllCommunities = TRUE))
+```
+
+## Evaluated Clusters
+
+We can evaluate the identified clusters with a histogram in relation to the user cutoff and show the outcome of the selection. The total number of clusters selected by `SelectByK` is a function of the `ClusterScalar` argument and the initial input data.
+
+```{r, clusters histogram, include = TRUE, echo = TRUE}
+P03 <- P02[[2]]
+P02 <- P02[[1]]
+
+plts <- vector(mode = "list",
+               length = length(P03))
+maxcounts <- vector(mode = "integer",
+                    length = length(P03))
+brks <- seq(from = 0,
+            to = 1,
+            by = 0.01)
+
+for (m1 in seq_along(P03)) {
+  plts[[m1]] <- hist(P03[[m1]][, "PID"],
+                     breaks = brks,
+                     plot = FALSE)
+  maxcounts[m1] <- max(plts[[m1]]$counts)
+}
+
+o1 <- order(maxcounts, decreasing = TRUE)
+
+plts <- plts[o1]
+
+for (m1 in seq_along(plts)) {
+  if (m1 > 1L) {
+    plot(plts[[m1]],
+         col = ColVec4[m1],
+         add = TRUE)
+  } else {
+    plot(plts[[m1]],
+         col = ColVec4[m1],
+         xlab = "PID",
+         ylab = "Frequency",
+         main = "Clustered Predictions")
+  }
+}
+
+abline(v = 0.5, lwd = 2.5, lty = 2)
+
+rm(P03)
+```
+
+## Some Other Things
+
+We can collect the single linkage sets of pairs for further evaluation.
+
+```{r, get sets, include = TRUE, echo = TRUE}
+Sets01 <- DisjointSet(Pairs = P02,
+                      Verbose = TRUE)
+```
+
+## End of workflow
+
+Save off our data and print out some session information.
+
+```{r, save and print session info, include = TRUE, echo = TRUE}
+TIMEEND <- Sys.time()
+# total time for the entire workflow
+print(TIMEEND - TIMESTART)
+
+save(Syn01,
+     L01,
+     P01,
+     P02,
+     Sets01,
+     file = paste0("data/",
+                   Selection,
+                   ".RData"),
+     compress = "xz")
+
+sessionInfo()
+```
+
