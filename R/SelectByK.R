@@ -35,6 +35,10 @@ SelectByK <- function(Pairs,
     warning ("User has requested a number of clusters that may not provide adequate group separation.")
   }
   
+  if (Verbose) {
+    TSTART <- Sys.time()
+  }
+  
   # normalize score,
   # convert absolute matches to relative
   # dat1 <- data.frame("RelativeMatch" = Pairs$ExactMatch * 2L / (Pairs$p1FeatureLength + Pairs$p2FeatureLength),
@@ -68,15 +72,26 @@ SelectByK <- function(Pairs,
   NClust <- 2:MaxClusters
   kmc <- vector(mode = "list",
                 length = length(NClust))
+  
+  if (Verbose) {
+    pBar <- txtProgressBar(style = 1)
+    PBAR <- length(NClust)
+  }
+  
   for (m1 in seq_along(NClust)) {
-    kmc[[m1]] <- kmeans(x = dat1,
-                        centers = NClust[m1],
-                        iter.max = 25L,
-                        nstart = 25L)
+    kmc[[m1]] <- suppressWarnings(kmeans(x = dat1,
+                                         centers = NClust[m1],
+                                         iter.max = 25L,
+                                         nstart = 25L))
     
     if (Verbose) {
-      print(m1)
+      setTxtProgressBar(pb = pBar,
+                        value = m1 / PBAR)
     }
+  }
+  if (Verbose) {
+    close(pBar)
+    cat("\n")
   }
   
   wss <- sapply(X = kmc,
@@ -223,6 +238,11 @@ SelectByK <- function(Pairs,
          main = "Pairs",
          xlab = "PID",
          ylab = "SCORE")
+  }
+  
+  if (Verbose) {
+    TEND <- Sys.time()
+    print(TEND - TSTART)
   }
   
   if (ReturnAllCommunities) {

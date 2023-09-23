@@ -13,24 +13,49 @@ knit: (function(inputFile, encoding) {
 
 # Working With SynExtend
 
-The SynExtend R package was originally built as a set of tools for building out lists of orthologous gene pairs from biological data, though it has since expanded. It is currently a work in progress. The provided workflow here is a simple example built to showcase usage and outputs of the orthology prediction tools housed within. The most unfinished part of this workflow is in the `SelectByK` function that uses a naive k-means based approach to drop assumed false positive pairs.
+The SynExtend R package was originally built as a set of tools for building out lists of orthologous gene pairs from biological data, though it has since expanded. It is currently a work in progress. The provided workflow here is a simple example built to showcase usage and outputs of the orthology prediction tools housed within. The most unfinished part of this workflow is in the `SelectByK` function that uses a naive k-means approach to drop assumed false positive pairs.
 
-## Initial workspace setup
+The original idea of this work was to provide high quality orthology inference tools to improve hypothesis generation post pair inference, and this workflow will be updated as new use cases can be accessed with these inferences. Currently the only task included here is a brief observation of the placement of pseudogenes as a percentage of coding genes on a phylogenetic tree.
 
-This workflow is loading in two ad-hoc functions, one is an updated version of a function within `SynExtend`, the other is an additional function for providing context to orthologous pairs.
+## Initial workspace setup and known TODO list
 
-```{r, libraries and functions and workspace setup, include = TRUE, echo = TRUE}
+This workflow is loading in four ad-hoc functions:
+
+* An updated version of the function `SelectByK` within `SynExtend`.
+* A function for providing context to orthologous pairs.
+* A function that is serving as a helper for `gffToDataFrame` in lieu of it's impending reformatting.
+* A helper function for organizing the shared core orthologs.
+
+A small TODO list for `SynExtend` includes updates to the function `gffToDataFrame` to improve usage with eukaryotes generally and with splice variants specifically, and adjustments to the `PairSummaries` function to take advantage of forking within R and make slightly more harmonious choices with pseudogene alignments.
+
+```{r, libraries-and-functions-and-workspace-setup, include = TRUE, echo = TRUE}
+
 # start the timer
 TIMESTART <- Sys.time()
 
 # load in some libraries 
 suppressMessages(library(SynExtend))
 suppressMessages(library(igraph))
+suppressMessages(library(dendextend))
+
+# chunk options
+knitr::opts_chunk$set(eval = TRUE,
+                      comment = "#",
+                      fig.align = "center",
+                      # out.width = "100%",
+                      dpi = 300)
+
 # SelectByK has had some minor adjustments, this imported version was added to v 1.13.5 (devel)
 source(file = "R/SelectByK.R",
        echo = FALSE)
 # The block size adjacency observer in PairSummaries() will eventually be superceded by this function
 source(file = "R/BlockSize.R",
+       echo = FALSE)
+# a helper function
+source(file = "R/GRangeToDFrame.R",
+       echo = FALSE)
+# a helper function
+source(file = "R/AlignCore.R",
        echo = FALSE)
 set.seed(1986)
 
@@ -48,12 +73,12 @@ ColVec4 <- ColVec3[c(1:6, 13, 15, 18)]
 
 ## Data Collection Part 1 
 
-The NCBI Edirect tools can be used to collect small, or large sets of data to evaluate. In this case a small example set of bacterial genomes and their annotations can be selected.
+The NCBI [Edirect](https://www.ncbi.nlm.nih.gov/books/NBK179288/) tools can be used to collect small or large sets of data, and are the only non-R dependency in this workflow currently. In this case a small example set of bacterial genomes and their annotations can be selected. The genus currently denoted by the `Selection` variable in the code chunk below was selected partially on a whim, but also partially because it creates a modestly sized data set with a reasonable amount of diversity, at least a few other convenient single genera sets like this exist. This example workflow runs within a manageable time frame on a MBP with modest specs. This initial data gathering step can be performed in almost any manner generally, as long as matched FNA and GFF files are the initial input to the workflow.
 
-```{r, edirect, include = TRUE, echo = TRUE}
+```{r, edirect-and-metadata, include = TRUE, echo = TRUE}
 # using NCBI edirect tools to grab a small digestible test set
 Selection <- "deinococcus"
-EntrezQuery <- paste("esearch -db assembly ",
+EntrezQuery <- paste0("esearch -db assembly ",
                      "-query '",
                      Selection,
                      "[organism] ",
@@ -63,23 +88,122 @@ EntrezQuery <- paste("esearch -db assembly ",
                      '| ',
                      'esummary ',
                      '| ',
-                     'xtract -pattern DocumentSummary -element FtpPath_RefSeq',
-                     sep = "")
-FtPPaths <- system(command = EntrezQuery,
+                     'xtract -pattern DocumentSummary -element FtpPath_RefSeq ',
+                     'BioSampleAccn ',
+                     'AssemblyStatus ',
+                     'SubmitterOrganization ',
+                     'SubmissionDate ',
+                     'Organism ',
+                     'Taxid ',
+                     'SpeciesName ',
+                     'ContigN50 ',
+                     'ScaffoldN50 ',
+                     'Coverage ',
+                     '-block Stat -if "@category" -equals total_length -element Stat')
+EntrezReply <- system(command = EntrezQuery,
                    intern = TRUE,
                    timeout = 500L)
-if (length(FtPPaths) > 5L) {
-  FtPPaths <- FtPPaths[sample(x = length(FtPPaths),
-                              size = 5L,
-                              replace = FALSE)]
+
+dat1 <- strsplit(x = EntrezReply,
+                 split = "\t",
+                 fixed = TRUE)
+dat1 <- do.call(rbind,
+                dat1[lengths(dat1) == 12])
+dat1 <- data.frame("FTP" = dat1[, 1L],
+                   "Biosample" = dat1[, 2L],
+                   "AssemblyStatus" = dat1[, 3L],
+                   "SubmitterOrg" = dat1[, 4L],
+                   "SubmissionDate" = dat1[, 5L],
+                   "Organism" = dat1[, 6L],
+                   "TaxID" = as.integer(dat1[, 7L]),
+                   "SpeciesName" = dat1[, 8L],
+                   "ContigN50" = as.integer(dat1[, 9L]),
+                   "ScaffoldN50" = as.integer(dat1[, 10L]),
+                   "Coverage" = as.numeric(dat1[, 11L]),
+                   "TotalLength" = as.integer(dat1[, 12L]))
+
+ReportedMethod <- ReportedTechnology <- vector(mode = "list",
+                                               length = nrow(dat1))
+
+pBar <- txtProgressBar(style = 1)
+PBAR <- nrow(dat1)
+for (m1 in seq_len(nrow(dat1))) {
+  r1 <- readLines(paste0(dat1$FTP[m1],
+                         "/",
+                         strsplit(dat1$FTP[m1],
+                                  split = "/",
+                                  fixed = TRUE)[[1]][10],
+                         "_assembly_report.txt"))
+  ReportedMethod[[m1]] <- r1[grepl(pattern = "Assembly method",
+                                   x = r1)]
+  ReportedTechnology[[m1]] <- r1[grepl(pattern = "Sequencing technology",
+                                       x = r1)]
+  
+  setTxtProgressBar(pb = pBar,
+                    value = m1 / PBAR)
 }
+close(pBar)
+cat("\n")
+
+# as of now, we care about Illumina, ONT, and PacBio (sorry to everyone else)
+# these following asks are a little narrow, and will likely need to be made a bit
+# more permissive to capture metadata better for less well behaved metadata submissions
+
+# though we've captured assembly method, we're not using it here, but it will be left
+# in the associated files on the repo
+ONTPres <- sapply(X = ReportedTechnology,
+                  FUN = function(x) {
+                    any(grepl(pattern = "Nanopore",
+                              x = x,
+                              ignore.case = TRUE))
+                  })
+ILLPres <- sapply(X = ReportedTechnology,
+                  FUN = function(x) {
+                    any(grepl(pattern = "Illumina",
+                              x = x,
+                              ignore.case = TRUE))
+                  })
+PBPres <- sapply(X = ReportedTechnology,
+                  FUN = function(x) {
+                    any(grepl(pattern = "PacBio",
+                              x = x,
+                              ignore.case = TRUE))
+                  })
+
+SeqTechOpt <- c("ONT", "Ill", "PB")
+SeqTech <- cbind("ONT" = ONTPres,
+                 "Ill" = ILLPres,
+                 "PB" = PBPres)
+SeqTech <- apply(X = SeqTech,
+                 MARGIN = 1,
+                 FUN = function(x) {
+                   if (any(x)) {
+                     paste(SeqTechOpt[x],
+                           collapse = " + ")
+                   } else {
+                     "Other"
+                   }
+                 })
+
+dat1 <- cbind(dat1,
+              "Technology" = SeqTech)
+
+save(dat1,
+     ReportedMethod,
+     file = paste0("data/",
+                   Selection,
+                   "_metadata.RData"),
+     compress = "xz")
+
 ```
 
 ## Data Collection Part 2
 
 Pull the FNA and GFF files associated with the selected genomes, build a DECIPHER DB, and manage the gene calls.
 
-```{r, data collection, include = TRUE, echo = TRUE}
+```{r, data-collection, include = TRUE, echo = TRUE}
+FtPPaths <- dat1$FTP
+
 # grab associated FNAs and GFFs
 FNAs <- unname(sapply(FtPPaths,
                       function(x) paste(x,
@@ -106,41 +230,85 @@ DBPATH <- paste0(getwd(),
                  Selection,
                  ".sqlite")
 
+pBar <- txtProgressBar(style = 1)
+PBAR <- length(FNAs)
+
 for (m1 in seq_along(FNAs)) {
   
-  
-  X <- readDNAStringSet(FNAs[m1])
-  
-  Seqs2DB(seqs = X,
-          type = "XStringSet",
+  Seqs2DB(seqs = FNAs[m1],
+          type = "FASTA",
           dbFile = DBPATH,
           identifier = as.character(m1),
-          verbose = TRUE)
+          verbose = FALSE)
   
-  GC01[[m1]] <- gffToDataFrame(GFF = GFFs[m1],
-                               Verbose = TRUE)
+  # a little funny business happens here because there's some work to do on the
+  # functions used to munge GFFs into an object that's a little easier for us to
+  # use
+  # this funny business is only necessary if you're interested in the
+  # pseudogene content of your dataset
+  # if you're not:
+  # GC01[[m1]] <- gffToDataFrame(GFF = GFFs[m1],
+  #                       Verbose = FALSE)
+  # will work just fine
+  tmp1 <- tempfile()
+  tmp2 <- paste0(tmp1,
+                 ".gff.gz")
+  download.file(url = GFFs[m1],
+                destfile = tmp2,
+                quiet = TRUE)
+  
+  ph1 <- rtracklayer::import(tmp2)
+  ph1 <- GRangeToDFrame(GRangeObject = ph1,
+                        Verbose = FALSE)
+  ph2 <- gffToDataFrame(GFF = tmp2,
+                        Verbose = FALSE)
+  unlink(tmp2)
+  
+  # slam the feature notes onto ph2 as the final column and move on
+  ph2 <- cbind(ph2,
+               "Note" = ph1$Note[match(x = ph1$ID,
+                                       table = ph2$ID)])
+  
+  GC01[[m1]] <- ph2
+  
+  setTxtProgressBar(pb = pBar,
+                    value = m1 / PBAR)
 }
+close(pBar)
+cat("\n")
+
+# if the sqlite DB is too large add it to the .gitignore file
+# # do this at the end looping through all the generated files
+# if (file.info(DBPATH)$size >= 25000000) {
+#   
+#   cat(paste0(DBPATH,
+#              "\n"),
+#       file = paste0(getwd(),
+#                     "/.gitignore"),
+#       append = TRUE)
+#   
+# }
 
 names(GC01) <- seq(length(GC01))
 ```
 
 ## Build a Synteny Map
 
-See the DECIPHER documentation for further reading. This is a modestly diverse set of genomes within the same genera, and what we see in the below pairs plot, combined with a general summary of syntenic hits is that though they share reasonable amounts of ordered information, those individual blocks of order are still pretty fractious. This is a modestly difficult test case for our tools in this workflow.
+See the DECIPHER documentation for further reading. This is a modestly diverse set of genomes within the same genera, and what we see subset of the data in the below pairs plot, combined with a general summary of syntenic hits is that though they share reasonable amounts of ordered information, those individual blocks of order are still pretty fractious. This is a modestly difficult test case for our tools in this workflow.
 
-```{r, synteny map, include = TRUE, echo = TRUE}
+```{r, synteny-map, include = TRUE, echo = TRUE}
 Syn01 <- FindSynteny(dbFile = DBPATH,
                      verbose = TRUE,
                      processors = NULL)
-print(Syn01)
-pairs(Syn01)
+print(Syn01[1:5, 1:5])
+pairs(Syn01[1:5, 1:5])
 ```
 
 ## Build Predicted Pairs
 
 Reconcile syntenic hits with gene calls to build out an initial list of predicted pairs.
 
-```{r, pairwise connections and evaluations, include = TRUE, echo = TRUE}
+```{r, pairwise-connections-and-evaluations, include = TRUE, echo = TRUE}
 L01 <- NucleotideOverlap(SyntenyObject = Syn01,
                          GeneCalls = GC01,
                          LimitIndex = FALSE,
@@ -157,33 +325,42 @@ hist(P01$PID, breaks = 100)
 
 ## State of the Data
 
-Some of these predictions are good, some are bad, and we have somewhat limited data available to evaluate these pairings. In the `P01` object, columns 3-8 represent generalized information about the blocks of information that led to the prediction, while columns 10, 11, and 12 represent general evaluations of the pairings themselves.
+Some of these predictions are good, some are bad, and we have somewhat limited data available to evaluate these pairings. In the `P01` object, columns 3-8 represent generalized information about the blocks of information that led to the prediction, while columns 10, 11, and 12 represent general evaluations of the pairings themselves. The initial object here is relatively large and pairs plots can be somewhat excessive, so to avoid stressing out our graphics devices we will sample only 50,000 rows.
 
-```{r, view pairs, include = TRUE, echo = TRUE}
+```{r, view-pairs, include = TRUE, echo = TRUE}
 head(P01)
 dim(P01)
 
-pairs(P01[, c(3:8, 10:12)], pch = 46)
+pairs(P01[sample(x = nrow(P01),
+                 size = 50000,
+                 replace = FALSE),
+          c(3:8, 10:12)], pch = 46)
 ```
 
 ## Evaluate Predicted Pairs
 
 As seen in the above histogram, predicted pairs span the range of available PIDs. Where users choose to threshold their PIDs is a complicated series of value judgements based on their downstream needs, and confidence preferences, however hard cutoffs are often inappropriate for the data generated herein. To give users at least some tools to avoid a hard threshold and effectively drop bad predictions, the `SelectByK` function was constructed to use a K-means approach where users provide a PID confidence that signifies the **lowest PID centroid at which a cluster represents TRUE pairings**.
 
-```{r, naively trim false positives, include = TRUE, echo = TRUE}
+```{r, trim-false-positives, include = TRUE, echo = TRUE}
+# the ReturnAllCommunities argument is set to TRUE here to allow us to illustrate
+# where the function is dropping predicted pairs
 P02 <- suppressWarnings(SelectByK(Pairs = P01,
                                   ClusterScalar = 4L, # default is 1, though that isn't likely to be aligned with user preferences
                                   UserConfidence = 0.5, # this is the PID that the cluster centroid must be above to be retained
                                   Verbose = TRUE,
                                   ShowPlot = TRUE,
                                   ReturnAllCommunities = TRUE))
+
+# reset GC01 with the attribute from the initial summaries, we're splitting these out in an attempt to keep our objects within reasonable size limits
+GC01 <- attr(x = P01,
+             which = "GeneCalls")
 ```
 
 ## Evaluated Clusters
 
 We can evaluate the identified clusters with a histogram in relation to the user cutoff and show the outcome of the selection. The total number of clusters selected by `SelectByK` is a function of the `ClusterScalar` argument and the initial input data.
 
-```{r, clusters histogram, include = TRUE, echo = TRUE}
+```{r, clusters-histogram, include = TRUE, echo = TRUE}
 P03 <- P02[[2]]
 P02 <- P02[[1]]
 
@@ -225,33 +402,286 @@ abline(v = 0.5, lwd = 2.5, lty = 2)
 rm(P03)
 ```
 
-## Some Other Things
+## Building a simple phylogeny
 
-We can collect the single linkage sets of pairs for further evaluation.
+We can collect the single-linkage sets of pairs for further evaluation. Though a variety of tools exist that allow us to perform community detection on the single-linkage sets, we are foregoing them here for simplicity. Some tools like [MCL](https://github.com/micans/mcl) perform this task before proceeding to their algorithm, will others, like the methods present in [igraph](https://igraph.org/) will attempt to evaluate the entire graph they are given, regardless of whether evaluations on distinct disjoint sets would be a more resource-appropriate choice.
 
-```{r, get sets, include = TRUE, echo = TRUE}
+```{r, get-sets-and-build-a-phylogeny, include = TRUE, echo = TRUE}
+
+# this is a simple implementation of union-merge to get our disjoint sets
 Sets01 <- DisjointSet(Pairs = P02,
                       Verbose = TRUE)
+
+attr(P02, "GeneCalls") <- GC01
+
+# identify sets without paralogs
+w1 <- sapply(X = Sets01,
+             FUN = function(x) {
+               y <- strsplit(x = x,
+                             split = "_",
+                             fixed = TRUE)
+               y <- do.call(rbind,
+                            y)
+               nrow(y) == length(unique(y[, 1L]))
+             },
+             simplify = TRUE)
+
+# extract out stringsets
+PotentialCoreGenes <- ExtractBy(x = P02,
+                                y = DBPATH,
+                                z = Sets01[w1 & lengths(Sets01) == length(GC01)],
+                                Verbose = TRUE)
+
+# perform some alignments, grab some annotations, and create some dendrograms
+CoreSet <- AlignCore(GeneCalls = GC01,
+                     PotentialCoreGenes = PotentialCoreGenes,
+                     Verbose = TRUE)
+
+# slam our core genes together and create a rough phylogeny
+CoreGenome <- do.call(xscat,
+                      CoreSet$Alignments)
+CoreDist <- DistanceMatrix(myXStringSet = CoreGenome,
+                           includeTerminalGaps = TRUE)
+CoreDend <- TreeLine(myXStringSet = CoreGenome,
+                     myDistMatrix = CoreDist,
+                     method = "NJ",
+                     showPlot = TRUE)
+
 ```
 
-## End of workflow
+## Build another simple tree
 
-Save off our data and print out some session information.
+We can proxy another dendrogram from the synteny map relatively easily, and compare it to our core genome phylogeny. This specific example isn't a particularly useful exploration, but gives a brief example of how to set up tree comparisons, and implement some tree distance comparisons in `SynExtend`.
+
+```{r, build-syn-dend-and-tanglegram, include = TRUE, echo = TRUE}
+
+SynDist <- matrix(data = 0,
+                  nrow = nrow(Syn01),
+                  ncol = ncol(Syn01))
+for (m1 in seq_len(nrow(Syn01) - 1L)) {
+  for (m2 in (m1 + 1L):nrow(Syn01)) {
+    y1 <- sum(Syn01[[m1, m1]])
+    y2 <- sum(Syn01[[m2, m2]])
+    ph1 <- 1 - ((sum(Syn01[[m1, m2]][, 4L]) * 2L) / (y1 + y2))
+    if (ph1 < 1) {
+      ph1 <- 0
+    }
+    SynDist[m1, m2] <- SynDist[m2, m1] <- 1 - ((sum(Syn01[[m1, m2]][, 4L]) * 2L) / (y1 + y2))
+  }
+}
+SynDend <- TreeLine(myDistMatrix = SynDist,
+                    method = "NJ")
+
+tanglegram(dendlist(CoreDend %>% set("branches_lwd", 1),
+                    SynDend %>% set("branches_lwd", 1)) %>% untangle(method = "ladderize"),
+           common_subtrees_color_lines = TRUE,
+           highlight_distinct_edges = TRUE,
+           highlight_branches_lwd = TRUE,
+           lwd = 2,
+           main_left = "Core Genome",
+           main_right = "Synteny")
+
+paste("Clustering Information Distance ==",
+      PhyloDistance(dend1 = CoreDend,
+                    dend2 = SynDend,
+                    Method = "CI"))
+paste("Robinson-Foulds Distance == ",
+      PhyloDistance(dend1 = CoreDend,
+                    dend2 = SynDend,
+                    Method = "RF"))
+paste("Kuhner-Felsenstein Distance ==",
+      PhyloDistance(dend1 = CoreDend,
+                    dend2 = SynDend,
+                    Method = "KF"))
+paste("Jaccard-Rboinson-Foulds Distance ==",
+      PhyloDistance(dend1 = CoreDend,
+                    dend2 = SynDend,
+                    Method = "JRF"))
+
+```
+
+
+```{r, plot-pseudos-against-tree, include = TRUE, echo = TRUE}
+
+fs_count <- sapply(X = GC01,
+                   FUN = function(x) {
+                     sum(grepl(pattern = "frameshifted", x = x$Note))
+                   })
+is_count <- sapply(X = GC01,
+                   FUN = function(x) {
+                     sum(grepl(pattern = "internal stop", x = x$Note))
+                   })
+coding_count <- sapply(X = GC01,
+                       FUN = function(x) {
+                         sum(x$Coding)
+                       })
+
+fs_per_feature <- fs_count / coding_count
+is_per_feature <- is_count / coding_count
+
+```
+
+## Pseudogenes by phylogeny
+
+We can visualize the percent of coding sequences with a noted internal stop (blue) or frameshift (red) against our generated phylogeny, while coloring the tips based on a rough extraction of the reporting sequencing technologies used.
+
+```{r, plot-pseudos-against-a-tree, echo = TRUE, include = TRUE}
+
+# give leaves a color attribute
+LeafColByLabel <- function(x, y) {
+  if (is.leaf(x)) {
+    # is a terminal partition / leaf / tip
+    label <- attr(x, "label")
+    attr(x, "edgePar") <- list("col" = y[names(y) == label])
+  }
+  x
+}
+labkey1 <- grepl(pattern = "ONT",
+                 x = dat1$Technology)
+labkey2 <- grepl(pattern = "PP",
+                 x = dat1$Technology)
+labkey3 <- grepl(pattern = "Ill",
+                 x = dat1$Technology)
+
+labkey4 <- rep(1, length(labkey1))
+labkey4[labkey1] <- 2
+labkey4[labkey2] <- 3
+labkey4[labkey3] <- 4
+labkey4[labkey1 & labkey3] <- 5
+labkey4[labkey2 & labkey3] <- 6
+Labs <- as.integer(labels(CoreDend))
+Labs2 <- ColVec1[labkey4]
+names(Labs2) <- Labs
+
+layout(mat = matrix(data = 1:2,
+                    ncol = 1))
+par(mar = c(0, 2.95, 2, 0.05))
+plot(dendrapply(X = CoreDend,
+                FUN = function(x) {
+                  LeafColByLabel(x = x, y = Labs2)
+                }),
+     nodePar = list(lab.cex = NA,
+                    pch = NA),
+     axes = FALSE,
+     main = "Deinococcus Pseudogenes")
+legend("topright",
+       legend = c("Other",
+                  "ONT",
+                  "PacBio",
+                  "Illumina",
+                  "Illumina + ONT",
+                  "Illumina + PacBio"),
+       col = ColVec1[1:6],
+       lty = 1,
+       bg = NA,
+       bty = "n",
+       cex = 0.75)
+# abline(v = 1) # you can use these to align the two plots!
+# abline(v = 31)
+par(mar = c(3, 2.95, 0, 0.05),
+    mgp = c(1.55, .75, 0))
+plot(x = 0,
+     y = 0,
+     axes = FALSE,
+     frame.plot = FALSE,
+     xlim = c(0.5, max(Labs) + 0.5),
+     ylim = c(-0.04, 0),
+     ylab = "% Pseudo Coding",
+     xlab = "",
+     type = "n")
+axis(side = 2,
+     at = seq(from = -0.04,
+              to = 0,
+              by = 0.01),
+     labels = seq(from = 4,
+                  to = 0,
+                  by = -1))
+# abline(v = 1) # you can use these to align the two plots!
+# abline(v = 31)
+o1 <- match(x = seq_along(fs_per_feature),
+            table = Labs)
+p1 <- fs_per_feature[o1] > is_per_feature[o1]
+for (m1 in seq_along(fs_per_feature)) {
+  rect(ybottom = -fs_per_feature[o1[m1]],
+       ytop = 0,
+       xleft = m1 - 0.48,
+       xright = m1,
+       xpd = TRUE,
+       col = "red",
+       border = NA)
+  rect(ybottom = -is_per_feature[o1[m1]],
+       ytop = 0,
+       xleft = m1,
+       xright = m1 + 0.48,
+       xpd = TRUE,
+       col = "blue",
+       border = NA)
+}
+```
+
+## Current End of workflow
+
+Save off our data, add anything that is too large for github our `.gitignore` file, and print out some session information. From here data like this is in a reasonable state to use for a variety of downstream computational biology tasks. As more functionality is added to `SynExtend`, more examples and plots will be added to this repo. Currently this workflow is easily manageable on a recent model Macbook Pro with 12 Cores and 64GB of RAM.
 
 ```{r, save and print session info, include = TRUE, echo = TRUE}
 TIMEEND <- Sys.time()
 # total time for the entire workflow
 print(TIMEEND - TIMESTART)
 
-save(Syn01,
-     L01,
-     P01,
-     P02,
-     Sets01,
+# our genecalls
+save(GC01,
      file = paste0("data/",
                    Selection,
-                   ".RData"),
+                   "_genecalls.RData"),
      compress = "xz")
+save(Sets01,
+     file = paste0("data/",
+                   Selection,
+                   "_sets.RData"))
+# in an attempt to make our items manageable for github we're stripping out the genecalls
+# and saving them separately
+attr(P02, "GeneCalls") <- NULL
+save(P02,
+     file = paste0("data/",
+                   Selection,
+                   "_pairs.RData"),
+     compress = "xz")
+save(Syn01,
+     file = paste0("data/",
+                   Selection,
+                   "_syn.RData"),
+     compress = "xz")
+save(L01,
+     file = paste0("data/",
+                   Selection,
+                   "_links.RData"),
+     compress = "xz")
+save(CoreSet,
+     file = paste0("data/",
+                   Selection,
+                   "_core.RData"))
+
+GeneratedData <- list.files("data")
+if (file.exists(".gitignore")) {
+  CurrentGitIgnore <- readLines(".gitignore")
+} else {
+  CurrentGitIgnore <- ""
+}
+
+# look through the data files and add anything that's too large to the gitignore file
+for (m1 in seq_along(GeneratedData)) {
+  CurrentEval <- paste0("data/",
+                       GeneratedData[m1])
+  
+  if (file.info(CurrentEval)$size >= 25000000 &
+      !(CurrentEval %in% CurrentGitIgnore)) {
+    cat(paste0("data/",
+               GeneratedData[m1],
+               "\n"),
+        file = ".gitignore",
+        append = TRUE)
+  }
+}
 
 sessionInfo()
 ```
