@@ -315,17 +315,6 @@ cat("\n")
 ```
 
 ``` r
-# if the sqlite DB is too large add it to the .gitignore file
-# # do this at the end looping through all the generated files
-# if (file.info(DBPATH)$size >= 25000000) {
-#   
-#   cat(paste0(DBPATH,
-#              "\n"),
-#       file = paste0(getwd(),
-#                     "/.gitignore"),
-#       append = TRUE)
-#   
-# }
 
 names(GC01) <- seq(length(GC01))
 ```
@@ -775,7 +764,7 @@ LeafColByLabel <- function(x, y) {
 }
 labkey1 <- grepl(pattern = "ONT",
                  x = dat1$Technology)
-labkey2 <- grepl(pattern = "PP",
+labkey2 <- grepl(pattern = "PB",
                  x = dat1$Technology)
 labkey3 <- grepl(pattern = "Ill",
                  x = dat1$Technology)
